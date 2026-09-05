@@ -1,0 +1,82 @@
+name: Assemble package-lock.json
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lock-b64/**"
+      - ".github/workflows/assemble-lock.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble package-lock.json from lock-b64 parts
+        run: |
+          python3 <<'PY'
+          import base64, gzip, hashlib, pathlib, sys
+
+          root = pathlib.Path("lock-b64")
+          want_lock = "74bc715b38975bc6f0b945be3757c4d9b832cf647e1a18b6081ee3e9ab56ac3d"
+          expected = {}
+          for line in (root / "checksums.txt").read_text().splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              digest, name = line.split()
+              expected[name] = digest
+
+          patches = {}
+          for line in (root / "patches.txt").read_text().splitlines():
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              name, idx, ch = line.split()
+              if len(ch) != 1:
+                  raise SystemExit(f"bad patch char {line!r}")
+              patches.setdefault(name, []).append((int(idx), ch))
+
+          parts = []
+          for i in range(8):
+              name = f"p{i}.txt"
+              text = "".join((root / name).read_text().split())
+              chars = list(text)
+              for idx, ch in patches.get(name, []):
+                  if idx < 0 or idx >= len(chars):
+                      raise SystemExit(f"patch oob {name} {idx}")
+                  chars[idx] = ch
+              text = "".join(chars)
+              digest = hashlib.sha256(text.encode("ascii")).hexdigest()
+              if digest != expected.get(name):
+                  raise SystemExit(
+                      f"checksum fail {name} got {digest} want {expected.get(name)} len {len(text)}"
+                  )
+              parts.append(text)
+
+          lock = gzip.decompress(base64.b64decode("".join(parts)))
+          digest = hashlib.sha256(lock).hexdigest()
+          if digest != want_lock:
+              raise SystemExit(f"lock sha fail {digest}")
+          path = pathlib.Path("package-lock.json")
+          if path.exists() and path.read_bytes() == lock:
+              print("package-lock.json already correct")
+          else:
+              path.write_bytes(lock)
+              print(f"wrote package-lock.json {len(lock)} bytes")
+          PY
+      - name: Commit assembled lockfile
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          if git diff --cached --quiet; then
+            echo "package-lock.json unchanged"
+            exit 0
+          fi
+          git commit -m "Add package-lock.json assembled from lock-b64 parts"
+          git push
